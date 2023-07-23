@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import curses
 import time
 from datetime import timedelta
 from xml.etree.ElementTree import fromstring
@@ -19,13 +18,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _trim(text, limit=40):
-    if len(text) < limit:
-        return text
-    else:
-        return text[:limit - 3] + '...'
-
-
 def read_api(args):
     if args.file:
         return ''.join(open(args.file).readlines())
@@ -39,7 +31,7 @@ def read_api(args):
     return r.content
 
 
-def main(scr, args):
+def main(args):
     try:
         while True:
             xml = fromstring(read_api(args))
@@ -47,40 +39,35 @@ def main(scr, args):
             inputs_by_key = {e.attrib['key']: i for i, e in enumerate(inputs)}
             inputs_by_index = {e.attrib['number']: i for i, e in enumerate(inputs)}
 
-            scr.clear()
-
             live = inputs[inputs_by_index[xml.find('active').text]]
-            scr.addstr(f"{_trim(live.attrib['title'])}\n")
+            print(f"LIVE: {live.attrib['title']}")
 
             overlays = live.findall("overlay")
             if overlays:
                 overlay = inputs[inputs_by_key[overlays[-1].attrib['key']]]
                 if overlay.attrib['type'] == 'GT':
-                    scr.addstr(f"{_trim(overlay.find('text').text)}\n")
+                    print(f"OVERLAY text: {overlay.find('text').text}")
 
             if live.attrib['type'] == 'VideoList':
                 if live.attrib['state'] == 'Running':
-                    scr.addstr('>  ')
+                    print('>  ', end='')
                 elif live.attrib['state'] == 'Paused':
-                    scr.addstr('|| ')
-                scr.addstr(str(timedelta(seconds=round(int(live.attrib['position']) / 1000))))
-                scr.addstr(' / ')
-                scr.addstr(str(timedelta(seconds=round(int(live.attrib['duration']) / 1000))))
-                scr.addstr('\n')
+                    print('|| ', end='')
+                print(timedelta(seconds=round(int(live.attrib['position']) / 1000)), end='')
+                print(' / ', end='')
+                print(timedelta(seconds=round(int(live.attrib['duration']) / 1000)))
 
-            external = inputs.find('input[@title="FEED TO APP"]')
+            external = inputs.find('input[@title="SLIDES STREAM"]')
             if external:
                 external_key = external.findall('overlay')[-1].attrib['key']
-                scr.addstr(f"APP: {_trim(inputs[inputs_by_key[external_key]].attrib['title'])}\n")
+                print(f"SLIDES: {inputs[inputs_by_key[external_key]].attrib['title']}")
 
-            audio = [_trim(i.attrib['title']) for i in inputs if
+            audio = [i.attrib['title'] for i in inputs if
                      'audiobusses' in i.attrib and
                      'M' in i.attrib['audiobusses'] and
                      i.attrib['muted'] == 'False' and
                      float(i.attrib['volume']) > 0]
-            scr.addstr(f"AUDIO: {audio}\n")
-
-            scr.refresh()
+            print(f"AUDIO: {audio}")
 
             time.sleep(5)
     except KeyboardInterrupt:
@@ -88,4 +75,4 @@ def main(scr, args):
 
 
 if __name__ == '__main__':
-    curses.wrapper(main, args=parse_args())
+    main(parse_args())
