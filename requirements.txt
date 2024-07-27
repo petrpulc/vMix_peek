@@ -1,1 +1,3 @@
-requests
+textual
+httpx
+google-api-python-client

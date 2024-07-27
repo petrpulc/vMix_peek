@@ -1,116 +1,220 @@
-#!/usr/bin/env python3
-import argparse
-import time
-from datetime import timedelta
+import json
+import webbrowser
+from collections import deque
 from xml.etree.ElementTree import fromstring
 
-import requests
-import logging
+import httpx
+from googleapiclient.discovery import build
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Static, Label, Sparkline, Markdown
+
+import credentials
+from schedule_dto import ScheduleDTO
+from vmix_dto import VMixDTO
+
+CAMERA_INPUTS = {'CAM1', 'WIDESHOT', 'STARTING SOON [D1]', 'ZOOM CAM [D4]', 'FINISH [F]'}
+SLIDE_INPUTS = {'SLIDES VENUE [C]', 'VIDEO IS PLAYING [V]', 'LOGO [X]', 'ZOOM SLIDES [C]'}
+VENUE_INPUTS = SLIDE_INPUTS.union(('CAPTIONS',))
+
+STREAMING_CAMERA = {'CAM1', 'WIDESHOT', 'ZOOM CAM [D4]'}
+STREAMING_SLIDES = {'SLIDES VENUE [C]', 'VIDEO IS PLAYING [V]', 'ZOOM SLIDES [C]'}
+STREAMING_AUDIO = {'MAIN AUDIO - VENUE [F8]', 'ZOOM AUDIO (VB-Audio Cable A)'}
+BREAK_CAMERA = {'STARTING SOON [D1]', 'FINISH [F]'}
+BREAK_SLIDES = {'LOGO [X]'}
+
+DEBUG = False
+LOCAL = False
 
 
-def get_input_active_sources(xml, index):
-    def __get_overlays(input):
-        visible_inputs = set()
-        for overlay in reversed(input.findall("overlay")):
-            visible_overlay_layers = __get_layers(inputs_by_key[overlay.attrib['key']])
-            visible_inputs.update(visible_overlay_layers)
-            if visible_overlay_layers and overlay.find('position') is None:
-                break
-        return visible_inputs
+class Session(Static):
+    def __init__(self, url, sheet, room, streamer):
+        self.url = url
+        self.sheet = sheet
+        self.room = room
+        self.streamer = streamer
 
-    def __get_layers(input):
-        visible_inputs = __get_overlays(input)
-        if input.attrib['type'] not in ('Placeholder', 'Audio'):
-            visible_inputs.add(input)
-        return visible_inputs
+        self.google_sheets = None
 
-    inputs = list(xml.find('inputs'))
-    inputs_by_key = {e.attrib['key']: e for e in inputs}
-    inputs_by_index = {e.attrib['number']: e for e in inputs}
-    mixes_active = list(e.find('active').text for e in xml.findall('mix'))
+        self.vmix = None
+        self.audio_monitor_l = deque(maxlen=10)
+        self.audio_monitor_r = deque(maxlen=10)
+        self.caption_monitor = deque(maxlen=5)
 
-    # TODO: assumed mapping for mixes is that earlier created mix is an earlier input, as the id is missing in API
-    index_mix_active = dict(zip([e.attrib['number'] for e in inputs if e.attrib['type'] == 'Mix'], mixes_active))
+        self.schedule = None
+        super().__init__()
 
-    layers = set()
+    def compose(self) -> ComposeResult:
+        yield Label(f"{self.sheet}  {self.room}  {self.streamer}  [@click=app.browser('{self.url}')]{self.url}[/ ]")
+        yield Horizontal(
+            Label(id="cam"),
+            Label(id="slides"),
+            Label(id="venue"),
+            Label(id="captions"),
+            Label(id="recording"),
+            Label(id="streaming"),
+            Markdown(id="audio"),
+            Vertical(
+                Sparkline(self.audio_monitor_l, id="audio_monitor_l"),
+                Sparkline(self.audio_monitor_r, id="audio_monitor_r"),
+                id="meters")
+        )
+        yield Markdown(id="schedule")
 
-    input_elem = inputs_by_index[index]
-    while input_elem.attrib['type'] == 'Mix':
-        layers.update(__get_overlays(input_elem))
-        input_elem = inputs_by_index[index_mix_active[index]]
+    def on_mount(self) -> None:
+        self.set_interval(5, self.fetch_vmix)
+        self.set_timer(1 / 30, self.fetch_vmix)
+        self.set_interval(300, self.fetch_google_sheets)
+        self.set_timer(1 / 30, self.fetch_google_sheets)
 
-    return __get_layers(input_elem)
+    def fetch_google_sheets(self) -> None:
+        if LOCAL:
+            data = json.load(open('schedule.json'))
+        else:
+            if self.google_sheets is None:
+                self.google_sheets = build("sheets", "v4", developerKey=credentials.google_key).spreadsheets().values()
+            data = \
+                self.google_sheets.get(spreadsheetId=credentials.google_sheet_id,
+                                       range=f"{self.sheet}!A9:K").execute()[
+                    'values']
+
+        self.schedule = ScheduleDTO(data)
+        self.update_schedule()
+
+    def update_schedule(self):
+        table = "|Title|Start|End|Note|\n"
+        table += "| - | - | - | - |\n"
+        # if self.schedule.previous:
+        #    table += f"|{self.schedule.previous.name}|{self.schedule.previous.start}|{self.schedule.previous.end}|{self.schedule.previous.note}|\n"
+
+        if self.schedule.get_current():
+            for e in self.schedule.get_current():
+                table += f"|**{e.name}**|{e.start}|{e.end}|{e.note}|\n"
+        elif self.schedule.get_next():
+            table += f"|*{self.schedule.get_next().name}*|{self.schedule.get_next().start}|{self.schedule.get_next().end}|{self.schedule.get_next().note}|\n"
+
+        self.query_one('#schedule', Markdown).update(table)
+
+    async def fetch_vmix(self) -> None:
+        if LOCAL:
+            xml = fromstring(open('2.xml').read())
+        else:
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get(self.url)
+                    xml = fromstring(response.content)
+                except Exception:
+                    return
+
+        self.vmix = VMixDTO(xml)
+        self.update_vmix()
+        if self.schedule:
+            self.update_schedule()
+
+    def update_vmix(self):
+        if self.vmix is None:
+            return
+
+        self.audio_monitor_l.append(float(self.vmix.audio_master.get('meterF1', 0)))
+        self.audio_monitor_r.append(float(self.vmix.audio_master.get('meterF2', 0)))
+        self.query_one('#audio_monitor_l', Sparkline).refresh()
+        self.query_one('#audio_monitor_r', Sparkline).refresh()
+
+        self.caption_monitor.append(self.vmix.captions)
+        self.query_one('#captions', Label).update('💬' if any(self.caption_monitor) else '🤐')
+
+        self.query_one('#recording', Label).update('🔴' if self.vmix.recording else '⏹️')
+        if self.vmix.streaming.get('channel1', '') == 'True' and self.vmix.streaming.get('channel2', '') == 'True':
+            self.query_one('#streaming', Label).update('🌍')
+        elif self.vmix.streaming.get('channel1', '') == 'True' or self.vmix.streaming.get('channel2', '') == 'True':
+            self.query_one('#streaming', Label).update('⚠️')
+        else:
+            self.query_one('#streaming', Label).update('😭')
+
+        stream_cam = self.vmix.stream_cam
+        stream_slides = self.vmix.stream_slides
+        venue = self.vmix.venue
+
+        if not DEBUG:
+            stream_cam = stream_cam.intersection(CAMERA_INPUTS)
+            stream_slides = stream_slides.intersection(SLIDE_INPUTS)
+            venue = venue.intersection(VENUE_INPUTS)
+
+        self.query_one('#cam', Label).update(', '.join(sorted(stream_cam)))
+        self.query_one('#slides', Label).update(', '.join(sorted(stream_slides)))
+        self.query_one('#venue', Label).update(', '.join(sorted(venue)))
+
+        audio = ', '.join(f'**{i["title"]}**' if float(i['meterF1']) > 0.1 else i["title"] for i in
+                          sorted(self.vmix.audio_master_inputs, key=lambda x: float(x['meterF1']), reverse=True))
+        self.query_one('#audio', Markdown).update(audio)
+
+        # Checks
+        if self.schedule:
+            if self.schedule.get_current():
+                if stream_cam.intersection(STREAMING_CAMERA):
+                    self.query_one("#cam").remove_class("error")
+                else:
+                    self.query_one("#cam").add_class("error")
+
+                if stream_slides.intersection(STREAMING_SLIDES):
+                    self.query_one("#slides").remove_class("error")
+                else:
+                    self.query_one("#slides").add_class("error")
+
+                if set(i['title'] for i in self.vmix.audio_master_inputs).intersection(STREAMING_AUDIO):
+                    self.query_one("#audio").remove_class("error")
+                else:
+                    self.query_one("#audio").add_class("error")
+
+                if self.vmix.recording:
+                    self.query_one("#recording").remove_class("error_icon")
+                    self.query_one("#recording").remove_class("warn_icon")
+                else:
+                    self.query_one("#recording").add_class("error_icon")
+                    self.query_one("#recording").remove_class("warn_icon")
+
+                if self.vmix.streaming.get('channel1', '') == 'True' and self.vmix.streaming.get('channel2',
+                                                                                                 '') == 'True':
+                    self.query_one("#streaming").remove_class("error_icon")
+                else:
+                    self.query_one("#streaming").add_class("error_icon")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8088)
-    parser.add_argument("--username", required=False)
-    parser.add_argument("--password", required=False)
-    parser.add_argument("--file", required=False, help="Testing file input")
-    parser.add_argument("ip")
-    return parser.parse_args()
+            else:
+                if stream_cam.intersection(BREAK_CAMERA):
+                    self.query_one("#cam").remove_class("error")
+                else:
+                    self.query_one("#cam").add_class("error")
+
+                if stream_slides.intersection(BREAK_SLIDES):
+                    self.query_one("#slides").remove_class("error")
+                else:
+                    self.query_one("#slides").add_class("error")
+
+                self.query_one("#audio").remove_class("error")
+
+                if self.vmix.recording:
+                    self.query_one("#recording").remove_class("error_icon")
+                    self.query_one("#recording").add_class("warn_icon")
+                else:
+                    self.query_one("#recording").remove_class("error_icon")
+                    self.query_one("#recording").remove_class("warn_icon")
+                self.query_one("#streaming").remove_class("error_icon")
 
 
-def read_api(args):
-    if args.file:
-        return ''.join(open(args.file).readlines())
+class VMixPeekApp(App):
+    CSS_PATH = "textual.css"
 
-    auth = None
-    if args.username:
-        auth = (args.username, args.password)
-    r = requests.get(f"http://{args.ip}:{args.port}/api", auth=auth)
-    if not r.ok:
-        logging.error("Unable to read from API")
-    return r.content
+    @staticmethod
+    def action_browser(url):
+        webbrowser.get('chrome').open(url)
 
-
-def main(args):
-    try:
-        while True:
-            xml = fromstring(read_api(args))
-            get_input_active_sources(xml, '25')
-            inputs = list(xml.find('inputs'))
-            inputs_by_key = {e.attrib['key']: e for e in inputs}
-            inputs_by_index = {e.attrib['number']: e for e in inputs}
-            mix_active = list(e.find('active').text for e in xml.findall('mix'))
+    def compose(self) -> ComposeResult:
+        streams = json.load(open('streams.json'))
+        for streamer, rooms in streams.items():
+            yield Horizontal(*[Session(r['vmix'], r['sheet'], r['room'], streamer) for r in rooms])
 
 
-            live = inputs_by_index[xml.find('active').text]
-
-            print(f"LIVE: {live.attrib['title']}")
-
-            overlays = live.findall("overlay")
-            if overlays:
-                overlay = inputs_by_key[overlays[-1].attrib['key']]
-                if overlay.attrib['type'] == 'GT':
-                    print(f"OVERLAY text: {overlay.find('text').text}")
-
-            if live.attrib['type'] == 'VideoList':
-                if live.attrib['state'] == 'Running':
-                    print('>  ', end='')
-                elif live.attrib['state'] == 'Paused':
-                    print('|| ', end='')
-                print(timedelta(seconds=round(int(live.attrib['position']) / 1000)), end='')
-                print(' / ', end='')
-                print(timedelta(seconds=round(int(live.attrib['duration']) / 1000)))
-
-            external = inputs.find('input[@title="SLIDES STREAM"]')
-            if external:
-                external_key = external.findall('overlay')[-1].attrib['key']
-                print(f"SLIDES: {inputs[inputs_by_key[external_key]].attrib['title']}")
-
-            audio = [i.attrib['title'] for i in inputs if
-                     'audiobusses' in i.attrib and
-                     'M' in i.attrib['audiobusses'] and
-                     i.attrib['muted'] == 'False' and
-                     float(i.attrib['volume']) > 0]
-            print(f"AUDIO: {audio}")
-
-            time.sleep(5)
-    except KeyboardInterrupt:
-        pass
-
-
-if __name__ == '__main__':
-    main(parse_args())
+if __name__ == "__main__":
+    app = VMixPeekApp()
+    app.run()
