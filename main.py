@@ -8,6 +8,40 @@ import requests
 import logging
 
 
+def get_input_active_sources(xml, index):
+    def __get_overlays(input):
+        visible_inputs = set()
+        for overlay in reversed(input.findall("overlay")):
+            visible_overlay_layers = __get_layers(inputs_by_key[overlay.attrib['key']])
+            visible_inputs.update(visible_overlay_layers)
+            if visible_overlay_layers and overlay.find('position') is None:
+                break
+        return visible_inputs
+
+    def __get_layers(input):
+        visible_inputs = __get_overlays(input)
+        if input.attrib['type'] not in ('Placeholder', 'Audio'):
+            visible_inputs.add(input)
+        return visible_inputs
+
+    inputs = list(xml.find('inputs'))
+    inputs_by_key = {e.attrib['key']: e for e in inputs}
+    inputs_by_index = {e.attrib['number']: e for e in inputs}
+    mixes_active = list(e.find('active').text for e in xml.findall('mix'))
+
+    # TODO: assumed mapping for mixes is that earlier created mix is an earlier input, as the id is missing in API
+    index_mix_active = dict(zip([e.attrib['number'] for e in inputs if e.attrib['type'] == 'Mix'], mixes_active))
+
+    layers = set()
+
+    input_elem = inputs_by_index[index]
+    while input_elem.attrib['type'] == 'Mix':
+        layers.update(__get_overlays(input_elem))
+        input_elem = inputs_by_index[index_mix_active[index]]
+
+    return __get_layers(input_elem)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8088)
@@ -35,16 +69,20 @@ def main(args):
     try:
         while True:
             xml = fromstring(read_api(args))
-            inputs = xml.find('inputs')
-            inputs_by_key = {e.attrib['key']: i for i, e in enumerate(inputs)}
-            inputs_by_index = {e.attrib['number']: i for i, e in enumerate(inputs)}
+            get_input_active_sources(xml, '25')
+            inputs = list(xml.find('inputs'))
+            inputs_by_key = {e.attrib['key']: e for e in inputs}
+            inputs_by_index = {e.attrib['number']: e for e in inputs}
+            mix_active = list(e.find('active').text for e in xml.findall('mix'))
 
-            live = inputs[inputs_by_index[xml.find('active').text]]
+
+            live = inputs_by_index[xml.find('active').text]
+
             print(f"LIVE: {live.attrib['title']}")
 
             overlays = live.findall("overlay")
             if overlays:
-                overlay = inputs[inputs_by_key[overlays[-1].attrib['key']]]
+                overlay = inputs_by_key[overlays[-1].attrib['key']]
                 if overlay.attrib['type'] == 'GT':
                     print(f"OVERLAY text: {overlay.find('text').text}")
 
