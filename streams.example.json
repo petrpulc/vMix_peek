@@ -1,0 +1,16 @@
+{
+  "Streamer": [
+    {
+      "vmix": "<URL of vmix api>",
+      "sheet": "<Name of the event sheet>",
+      "room": "<Room (to help with identification)>"
+    }
+  ],
+  "Foo Bar": [
+    {
+      "vmix": "http://10.2.3.4:8088/api",
+      "sheet": "Wor_ASDF",
+      "room": "A1"
+    }
+  ]
+}
